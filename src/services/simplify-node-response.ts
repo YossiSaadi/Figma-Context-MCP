@@ -1,276 +1,216 @@
-import { SimplifiedLayout, buildSimplifiedLayout } from "~/transformers/layout.js";
-import type {
-  GetFileNodesResponse,
-  Node as FigmaDocumentNode,
-  Paint,
-  Vector,
-  GetFileResponse,
-} from "@figma/rest-api-spec";
-import { hasValue, isRectangleCornerRadii, isTruthy } from "~/utils/identity.js";
-import { removeEmptyKeys, generateVarId, StyleId, parsePaint, isVisible } from "~/utils/common.js";
-import { buildSimplifiedStrokes, SimplifiedStroke } from "~/transformers/style.js";
-import { buildSimplifiedEffects, SimplifiedEffects } from "~/transformers/effects.js";
-/**
- * TODO ITEMS
- *
- * - Improve layout handling—translate from Figma vocabulary to CSS
- * - Pull image fills/vectors out to top level for better AI visibility
- *   ? Implement vector parents again for proper downloads
- * ? Look up existing styles in new MCP endpoint—Figma supports individual lookups without enterprise /v1/styles/:key
- * ? Parse out and save .cursor/rules/design-tokens file on command
- **/
+import type { Node as FigmaDocumentNode } from "@figma/rest-api-spec";
+import { processComponentData } from "./process-component-data.js";
+import { ComponentData } from "~/types/component.js";
 
-// -------------------- SIMPLIFIED STRUCTURES --------------------
-
-export type TextStyle = Partial<{
-  fontFamily: string;
-  fontWeight: number;
-  fontSize: number;
-  lineHeight: string;
-  letterSpacing: string;
-  textCase: string;
-  textAlignHorizontal: string;
-  textAlignVertical: string;
-}>;
-export type StrokeWeights = {
-  top: number;
-  right: number;
-  bottom: number;
-  left: number;
-};
-type StyleTypes =
-  | TextStyle
-  | SimplifiedFill[]
-  | SimplifiedLayout
-  | SimplifiedStroke
-  | SimplifiedEffects
-  | string;
-type GlobalVars = {
-  styles: Record<StyleId, StyleTypes>;
-};
-export interface SimplifiedDesign {
-  name: string;
-  lastModified: string;
-  thumbnailUrl: string;
-  nodes: SimplifiedNode[];
-  globalVars: GlobalVars;
-}
-
-export interface SimplifiedNode {
+export interface SimplifiedNode extends ComponentData {
   id: string;
   name: string;
-  type: string; // e.g. FRAME, TEXT, INSTANCE, RECTANGLE, etc.
-  // geometry
-  boundingBox?: BoundingBox;
-  // text
+  type: string;
+  boundingBox?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
   text?: string;
-  textStyle?: string;
-  // appearance
-  fills?: string;
-  styles?: string;
-  strokes?: string;
-  effects?: string;
+  textStyle?: {
+    fontFamily: string;
+    fontSize: number;
+    fontWeight: number;
+    lineHeight: number;
+    letterSpacing: number;
+    textAlignHorizontal: string;
+    textAlignVertical: string;
+  };
+  fills?: string[];
+  styles?: Record<string, string>;
+  strokes?: string[];
+  effects?: string[];
   opacity?: number;
   borderRadius?: string;
-  // layout & alignment
-  layout?: string;
-  // backgroundColor?: ColorValue; // Deprecated by Figma API
-  // for rect-specific strokes, etc.
-  // children
   children?: SimplifiedNode[];
 }
 
-export interface BoundingBox {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-export type CSSRGBAColor = `rgba(${number}, ${number}, ${number}, ${number})`;
-export type CSSHexColor = `#${string}`;
-export type SimplifiedFill =
-  | {
-      type?: Paint["type"];
-      hex?: string;
-      rgba?: string;
-      opacity?: number;
-      imageRef?: string;
-      scaleMode?: string;
-      gradientHandlePositions?: Vector[];
-      gradientStops?: {
-        position: number;
-        color: ColorValue | string;
-      }[];
-    }
-  | CSSRGBAColor
-  | CSSHexColor;
-
-export interface ColorValue {
-  hex: string;
-  opacity: number;
-}
-
-// ---------------------- PARSING ----------------------
-export function parseFigmaResponse(data: GetFileResponse | GetFileNodesResponse): SimplifiedDesign {
-  const { name, lastModified, thumbnailUrl } = data;
-  let nodes: FigmaDocumentNode[];
-  if ("document" in data) {
-    nodes = Object.values(data.document.children);
-  } else {
-    nodes = Object.values(data.nodes).map((n) => n.document);
-  }
-  let globalVars: GlobalVars = {
-    styles: {},
+export interface SimplifiedDesign {
+  metadata: {
+    name: string;
+    lastModified: string;
+    thumbnailUrl: string;
   };
-  const simplifiedNodes: SimplifiedNode[] = nodes
-    .filter(isVisible)
-    .map((n) => parseNode(globalVars, n))
-    .filter((child) => child !== null && child !== undefined);
+  nodes: SimplifiedNode[];
+  globalVars: {
+    styles: Record<string, any>;
+  };
+}
+
+export function parseFigmaResponse(response: any): SimplifiedDesign {
+  const { name, lastModified, thumbnailUrl, nodes } = response;
+  const globalVars = { styles: {} };
+  const parsedNodes: SimplifiedNode[] = [];
+
+  for (const nodeId in nodes) {
+    const node = nodes[nodeId].document;
+    const parsedNode = parseNode(node, globalVars);
+    if (parsedNode) {
+      parsedNodes.push(parsedNode);
+    }
+  }
 
   return {
-    name,
-    lastModified,
-    thumbnailUrl: thumbnailUrl || "",
-    nodes: simplifiedNodes,
+    metadata: {
+      name,
+      lastModified,
+      thumbnailUrl,
+    },
+    nodes: parsedNodes,
     globalVars,
   };
 }
 
-// Helper function to find node by ID
-const findNodeById = (id: string, nodes: SimplifiedNode[]): SimplifiedNode | undefined => {
-  for (const node of nodes) {
-    if (node?.id === id) {
-      return node;
-    }
-
-    if (node?.children && node.children.length > 0) {
-      const foundInChildren = findNodeById(id, node.children);
-      if (foundInChildren) {
-        return foundInChildren;
-      }
-    }
-  }
-
-  return undefined;
-};
-
-/**
- * Find or create global variables
- * @param globalVars - Global variables object
- * @param value - Value to store
- * @param prefix - Variable ID prefix
- * @returns Variable ID
- */
-function findOrCreateVar(globalVars: GlobalVars, value: any, prefix: string): StyleId {
-  // Check if the same value already exists
-  const [existingVarId] =
-    Object.entries(globalVars.styles).find(
-      ([_, existingValue]) => JSON.stringify(existingValue) === JSON.stringify(value),
-    ) ?? [];
-
-  if (existingVarId) {
-    return existingVarId as StyleId;
-  }
-
-  // Create a new variable if it doesn't exist
-  const varId = generateVarId(prefix);
-  globalVars.styles[varId] = value;
-  return varId;
+function findOrCreateVar(
+  globalVars: { styles: Record<string, any> },
+  type: string,
+  value: any
+): string {
+  const key = `${type}_${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+  globalVars.styles[key] = value;
+  return key;
 }
 
 function parseNode(
-  globalVars: GlobalVars,
   n: FigmaDocumentNode,
-  parent?: FigmaDocumentNode,
+  globalVars: { styles: Record<string, any> }
 ): SimplifiedNode | null {
-  const { id, name, type } = n;
+  if (!n) return null;
 
-  const simplified: SimplifiedNode = {
-    id,
-    name,
-    type,
+  const node: SimplifiedNode = {
+    id: n.id,
+    name: n.name,
+    type: n.type === "VECTOR" ? "IMAGE-SVG" : n.type,
   };
 
-  // text
-  if (hasValue("style", n) && Object.keys(n.style).length) {
-    const style = n.style;
-    const textStyle = {
-      fontFamily: style.fontFamily,
-      fontWeight: style.fontWeight,
-      fontSize: style.fontSize,
-      lineHeight:
-        style.lineHeightPx && style.fontSize
-          ? `${style.lineHeightPx / style.fontSize}em`
-          : undefined,
-      letterSpacing:
-        style.letterSpacing && style.letterSpacing !== 0 && style.fontSize
-          ? `${(style.letterSpacing / style.fontSize) * 100}%`
-          : undefined,
-      textCase: style.textCase,
-      textAlignHorizontal: style.textAlignHorizontal,
-      textAlignVertical: style.textAlignVertical,
+  // Process component data
+  const componentData = processComponentData(n);
+  if (componentData) {
+    Object.assign(node, componentData);
+  }
+
+  if (n.absoluteBoundingBox) {
+    node.boundingBox = {
+      x: n.absoluteBoundingBox.x,
+      y: n.absoluteBoundingBox.y,
+      width: n.absoluteBoundingBox.width,
+      height: n.absoluteBoundingBox.height,
     };
-    simplified.textStyle = findOrCreateVar(globalVars, textStyle, "style");
   }
 
-  // fills & strokes
-  if (hasValue("fills", n) && Array.isArray(n.fills) && n.fills.length) {
-    // const fills = simplifyFills(n.fills.map(parsePaint));
-    const fills = n.fills.map(parsePaint);
-    simplified.fills = findOrCreateVar(globalVars, fills, "fill");
+  if (n.characters) {
+    node.text = n.characters;
   }
 
-  const strokes = buildSimplifiedStrokes(n);
-  if (strokes.colors.length) {
-    simplified.strokes = findOrCreateVar(globalVars, strokes, "stroke");
+  if (n.style) {
+    node.textStyle = {
+      fontFamily: n.style.fontFamily,
+      fontSize: n.style.fontSize,
+      fontWeight: n.style.fontWeight,
+      lineHeight: n.style.lineHeightPx,
+      letterSpacing: n.style.letterSpacing,
+      textAlignHorizontal: n.style.textAlignHorizontal,
+      textAlignVertical: n.style.textAlignVertical,
+    };
   }
 
-  const effects = buildSimplifiedEffects(n);
-  if (Object.keys(effects).length) {
-    simplified.effects = findOrCreateVar(globalVars, effects, "effect");
+  if (n.fills?.length) {
+    node.fills = n.fills.map((fill) => {
+      if (fill.type === "SOLID") {
+        return findOrCreateVar(globalVars, "fill", [
+          `#${Math.round(fill.color.r * 255)
+            .toString(16)
+            .padStart(2, "0")}${Math.round(fill.color.g * 255)
+            .toString(16)
+            .padStart(2, "0")}${Math.round(fill.color.b * 255)
+            .toString(16)
+            .padStart(2, "0")}`,
+        ]);
+      }
+      return findOrCreateVar(globalVars, "fill", fill);
+    });
   }
 
-  // Process layout
-  const layout = buildSimplifiedLayout(n, parent);
-  if (Object.keys(layout).length > 1) {
-    simplified.layout = findOrCreateVar(globalVars, layout, "layout");
+  if (n.strokes?.length) {
+    node.strokes = n.strokes.map((stroke) => {
+      return findOrCreateVar(globalVars, "stroke", {
+        colors: [
+          `#${Math.round(stroke.color.r * 255)
+            .toString(16)
+            .padStart(2, "0")}${Math.round(stroke.color.g * 255)
+            .toString(16)
+            .padStart(2, "0")}${Math.round(stroke.color.b * 255)
+            .toString(16)
+            .padStart(2, "0")}`,
+        ],
+        strokeWeight: `${n.strokeWeight}px`,
+      });
+    });
   }
 
-  // Keep other simple properties directly
-  if (hasValue("characters", n, isTruthy)) {
-    simplified.text = n.characters;
+  if (n.effects?.length) {
+    node.effects = n.effects.map((effect) => {
+      return findOrCreateVar(globalVars, "effect", {
+        boxShadow: `${effect.offset.x}px ${effect.offset.y}px ${
+          effect.radius
+        }px 0px rgba(0, 0, 0, ${effect.color.a})`,
+      });
+    });
   }
 
-  // border/corner
-
-  // opacity
-  if (hasValue("opacity", n) && typeof n.opacity === "number" && n.opacity !== 1) {
-    simplified.opacity = n.opacity;
-  }
-
-  if (hasValue("cornerRadius", n) && typeof n.cornerRadius === "number") {
-    simplified.borderRadius = `${n.cornerRadius}px`;
-  }
-  if (hasValue("rectangleCornerRadii", n, isRectangleCornerRadii)) {
-    simplified.borderRadius = `${n.rectangleCornerRadii[0]}px ${n.rectangleCornerRadii[1]}px ${n.rectangleCornerRadii[2]}px ${n.rectangleCornerRadii[3]}px`;
-  }
-
-  // Recursively process child nodes
-  if (hasValue("children", n) && n.children.length > 0) {
-    let children = n.children
-      .filter(isVisible)
-      .map((child) => parseNode(globalVars, child, n))
-      .filter((child) => child !== null && child !== undefined);
-    if (children.length) {
-      simplified.children = children;
+  if (n.styles) {
+    node.styles = {};
+    for (const [key, value] of Object.entries(n.styles)) {
+      node.styles[key] = value.key;
     }
   }
 
-  // Convert VECTOR to IMAGE
-  if (type === "VECTOR") {
-    simplified.type = "IMAGE-SVG";
+  if (typeof n.opacity === "number") {
+    node.opacity = n.opacity;
   }
 
-  return removeEmptyKeys(simplified);
+  if (n.cornerRadius) {
+    node.borderRadius = `${n.cornerRadius}px`;
+  }
+
+  if (n.layoutMode) {
+    const layoutKey = findOrCreateVar(globalVars, "layout", {
+      mode: n.layoutMode.toLowerCase(),
+      ...(n.primaryAxisAlignItems && {
+        justifyContent: n.primaryAxisAlignItems.toLowerCase(),
+      }),
+      ...(n.counterAxisAlignItems && {
+        alignItems: n.counterAxisAlignItems.toLowerCase(),
+      }),
+      ...(n.itemSpacing && { gap: `${n.itemSpacing}px` }),
+      ...(n.paddingLeft && {
+        padding: `${n.paddingTop}px ${n.paddingRight}px ${n.paddingBottom}px ${n.paddingLeft}px`,
+      }),
+      sizing: {
+        horizontal: n.layoutSizingHorizontal?.toLowerCase(),
+        vertical: n.layoutSizingVertical?.toLowerCase(),
+      },
+      ...(n.width && {
+        dimensions: {
+          width: n.width,
+          height: n.height,
+        },
+      }),
+    });
+    node.layout = layoutKey;
+  }
+
+  if (n.children) {
+    node.children = n.children
+      .map((child) => parseNode(child, globalVars))
+      .filter((n): n is SimplifiedNode => n !== null);
+  }
+
+  return node;
 }
